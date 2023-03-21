@@ -1,2 +1,2 @@
 # bus
-infra.go bus module.
+infra.Go bus module.
