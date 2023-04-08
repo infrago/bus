@@ -11,10 +11,6 @@ type (
 		Workload int64
 	}
 
-	Delegate interface {
-		Serve(name string, data []byte, callback Callback)
-	}
-
 	// Connect 连接
 	Connect interface {
 		Open() error
@@ -28,5 +24,6 @@ type (
 
 		Request(name string, data []byte, timeout time.Duration) ([]byte, error)
 	}
+
 	Callback = func([]byte, error)
 )
