@@ -7,14 +7,13 @@ import (
 )
 
 func (this *Instance) Serve(name string, data []byte, next Callback) {
-	// 事件不限制线程数
+	// 总线不限制线程数
 	this.module.pool.Submit(func() {
 		this.serving(name, data, next)
 	})
 }
 
 // 收到消息
-// 待处理，要改成异步，做线程池
 func (this *Instance) serving(name string, data []byte, next Callback) {
 	if strings.HasPrefix(name, this.Config.Prefix) {
 		name = strings.TrimPrefix(name, this.Config.Prefix)
