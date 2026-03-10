@@ -24,20 +24,24 @@ type (
 	defaultBusDriver struct{}
 
 	defaultBusConnection struct {
-		mutex    sync.RWMutex
-		running  bool
-		services map[string]struct{}
-		instance *Instance
-		prefix   string
+		mutex        sync.RWMutex
+		running      bool
+		services     map[string]struct{}
+		messages     map[string]struct{}
+		instance     *Instance
+		prefix       string
+		serviceRetry map[string][]time.Duration
 	}
 )
 
 // Connect establishes an in-memory
 func (driver *defaultBusDriver) Connect(inst *Instance) (Connection, error) {
 	return &defaultBusConnection{
-		services: make(map[string]struct{}, 0),
-		instance: inst,
-		prefix:   inst.Config.Prefix,
+		services:     make(map[string]struct{}, 0),
+		messages:     make(map[string]struct{}, 0),
+		instance:     inst,
+		prefix:       inst.Config.Prefix,
+		serviceRetry: make(map[string][]time.Duration, 0),
 	}, nil
 }
 
@@ -68,8 +72,7 @@ func (c *defaultBusConnection) Stop() error {
 	return nil
 }
 
-// Register registers a service subject for local handling.
-func (c *defaultBusConnection) Register(subject string) error {
+func (c *defaultBusConnection) RegisterService(subject string, retries []time.Duration) error {
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 
@@ -78,6 +81,20 @@ func (c *defaultBusConnection) Register(subject string) error {
 	}
 
 	c.services[subject] = struct{}{}
+	c.serviceRetry[subject] = append([]time.Duration{}, retries...)
+
+	return nil
+}
+
+func (c *defaultBusConnection) RegisterMessage(subject string) error {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	if subject == "" {
+		return errBusInvalidTarget
+	}
+
+	c.messages[subject] = struct{}{}
 
 	return nil
 }
@@ -90,20 +107,25 @@ func (c *defaultBusConnection) Request(_ string, data []byte, _ time.Duration) (
 	return c.instance.HandleCall(data)
 }
 
-// Publish broadcasts event to all local handlers - for in-memory, invoke local.
+// Publish broadcasts message to all local handlers - for in-memory, invoke local.
 func (c *defaultBusConnection) Publish(_ string, data []byte) error {
 	if c.instance == nil {
 		c.instance = &Instance{}
 	}
-	return c.instance.HandleAsync(data)
+	return c.instance.HandleMessage(data)
 }
 
 // Enqueue handles queued call - for in-memory bus, directly invoke local.
-func (c *defaultBusConnection) Enqueue(_ string, data []byte) error {
+func (c *defaultBusConnection) Enqueue(subject string, data []byte) error {
 	if c.instance == nil {
 		c.instance = &Instance{}
 	}
-	return c.instance.HandleAsync(data)
+	if strings.HasPrefix(subject, "publish.") {
+		return c.instance.HandleMessage(data)
+	}
+	service := strings.TrimPrefix(subject, "queue.")
+	c.dispatchService(data, 1, append([]time.Duration{}, c.serviceRetry[service]...))
+	return nil
 }
 
 // Stats returns empty stats for in-memory
@@ -177,4 +199,29 @@ func (c *defaultBusConnection) serviceName(subject string) string {
 		return subject
 	}
 	return strings.TrimPrefix(subject, c.prefix)
+}
+
+func (c *defaultBusConnection) dispatchService(data []byte, attempt int, retries []time.Duration) {
+	if c.instance == nil {
+		c.instance = &Instance{}
+	}
+
+	err := c.instance.HandleServiceAsync(data, attempt, DispatchFinal(retries, attempt))
+	if err == nil || !IsRetryableDispatchError(err) {
+		return
+	}
+
+	delay, ok := DispatchRetryDelay(retries, attempt)
+	if !ok {
+		return
+	}
+	time.AfterFunc(delay, func() {
+		c.mutex.RLock()
+		running := c.running
+		c.mutex.RUnlock()
+		if !running {
+			return
+		}
+		c.dispatchService(data, attempt+1, retries)
+	})
 }

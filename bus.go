@@ -17,6 +17,7 @@ import (
 
 var (
 	errBusNotReady = errors.New("bus is not ready")
+	errBusReserved = errors.New("bus name uses reserved prefix")
 )
 
 var (
@@ -26,6 +27,7 @@ var (
 		connections: make(map[string]Connection, 0),
 		weights:     make(map[string]int, 0),
 		services:    make(map[string]serviceMeta, 0),
+		messages:    make(map[string]serviceMeta, 0),
 	}
 	host = infra.Mount(module)
 )
@@ -46,7 +48,8 @@ type (
 		Start() error
 		Stop() error
 
-		Register(subject string) error
+		RegisterService(subject string, retries []time.Duration) error
+		RegisterMessage(subject string) error
 
 		Request(subject string, data []byte, timeout time.Duration) ([]byte, error)
 		Publish(subject string, data []byte) error
@@ -66,6 +69,7 @@ type (
 		weights     map[string]int
 		wrr         *util.WRR
 		services    map[string]serviceMeta
+		messages    map[string]serviceMeta
 
 		opened  bool
 		started bool
@@ -87,8 +91,13 @@ type (
 	Configs map[string]Config
 
 	serviceMeta struct {
-		name string
-		desc string
+		name          string
+		desc          string
+		dispatchRetry []time.Duration
+	}
+
+	DispatchError struct {
+		res base.Res
 	}
 )
 
@@ -97,6 +106,9 @@ const (
 	subjectQueue = "queue"
 	subjectEvent = "event"
 	subjectGroup = "publish"
+
+	// names with this prefix are reserved for bus internal control channels.
+	reservedNamePrefix = "_"
 )
 
 type (
@@ -138,6 +150,16 @@ func (m *busModule) Register(name string, value base.Any) {
 				target = name + "." + key
 			}
 			m.RegisterService(target, svc)
+		}
+	case infra.Message:
+		m.RegisterMessage(name, v)
+	case infra.Messages:
+		for key, msg := range v {
+			target := key
+			if name != "" {
+				target = name + "." + key
+			}
+			m.RegisterMessage(target, msg)
 		}
 	}
 }
@@ -203,8 +225,28 @@ func (m *busModule) RegisterService(name string, svc infra.Service) {
 	if name == "" {
 		return
 	}
+	if err := validateBusName(name); err != nil {
+		panic(err.Error() + ": " + name)
+	}
 	m.mutex.Lock()
-	m.services[name] = serviceMeta{name: svc.Name, desc: svc.Desc}
+	m.services[name] = serviceMeta{
+		name:          svc.Name,
+		desc:          svc.Desc,
+		dispatchRetry: normalizeDurations(svc.Retry),
+	}
+	m.mutex.Unlock()
+}
+
+// RegisterMessage binds message name into bus subjects.
+func (m *busModule) RegisterMessage(name string, msg infra.Message) {
+	if name == "" {
+		return
+	}
+	if err := validateBusName(name); err != nil {
+		panic(err.Error() + ": " + name)
+	}
+	m.mutex.Lock()
+	m.messages[name] = serviceMeta{name: msg.Name, desc: msg.Desc}
 	m.mutex.Unlock()
 }
 
@@ -327,9 +369,15 @@ func (m *busModule) Open() {
 			panic("Failed to open bus: " + err.Error())
 		}
 
-		for svc := range m.services {
+		for svc, meta := range m.services {
 			base := m.subjectBase(cfg.Prefix, svc)
-			if err := conn.Register(base); err != nil {
+			if err := conn.RegisterService(base, meta.dispatchRetry); err != nil {
+				panic("Failed to register bus: " + err.Error())
+			}
+		}
+		for msg := range m.messages {
+			base := m.subjectBase(cfg.Prefix, msg)
+			if err := conn.RegisterMessage(base); err != nil {
 				panic("Failed to register bus: " + err.Error())
 			}
 		}
@@ -447,6 +495,10 @@ func (m *busModule) pick() (Connection, string) {
 
 // Request sends a request and waits for reply.
 func (m *busModule) Request(meta *infra.Meta, name string, value base.Map, timeout time.Duration) (base.Map, base.Res) {
+	if err := validateBusName(name); err != nil {
+		return nil, infra.ErrorResult(err)
+	}
+
 	conn, prefix := m.pick()
 
 	if conn == nil {
@@ -470,6 +522,10 @@ func (m *busModule) Request(meta *infra.Meta, name string, value base.Map, timeo
 
 // Broadcast sends to all subscribers.
 func (m *busModule) Broadcast(meta *infra.Meta, name string, value base.Map) error {
+	if err := validateBusName(name); err != nil {
+		return err
+	}
+
 	conn, prefix := m.pick()
 
 	if conn == nil {
@@ -486,8 +542,12 @@ func (m *busModule) Broadcast(meta *infra.Meta, name string, value base.Map) err
 	return conn.Publish(subject, data)
 }
 
-// Publish sends grouped publish: one subscriber per profile(group).
-func (m *busModule) Publish(meta *infra.Meta, name string, value base.Map) error {
+// Rolecast sends grouped message: one receiver per role(group).
+func (m *busModule) Rolecast(meta *infra.Meta, name string, value base.Map) error {
+	if err := validateBusName(name); err != nil {
+		return err
+	}
+
 	conn, prefix := m.pick()
 
 	if conn == nil {
@@ -504,8 +564,12 @@ func (m *busModule) Publish(meta *infra.Meta, name string, value base.Map) error
 	return conn.Enqueue(subject, data)
 }
 
-// Enqueue sends to a queue (one subscriber receives).
-func (m *busModule) Enqueue(meta *infra.Meta, name string, value base.Map) error {
+// Dispatch sends async service execution to queue (one subscriber receives).
+func (m *busModule) Dispatch(meta *infra.Meta, name string, value base.Map) error {
+	if err := validateBusName(name); err != nil {
+		return err
+	}
+
 	conn, prefix := m.pick()
 
 	if conn == nil {
@@ -520,6 +584,16 @@ func (m *busModule) Enqueue(meta *infra.Meta, name string, value base.Map) error
 	baseName := m.subjectBase(prefix, name)
 	subject := m.subject("", subjectQueue, baseName)
 	return conn.Enqueue(subject, data)
+}
+
+// Publish is compatibility alias of Rolecast.
+func (m *busModule) Publish(meta *infra.Meta, name string, value base.Map) error {
+	return m.Rolecast(meta, name, value)
+}
+
+// Enqueue is compatibility alias of Dispatch.
+func (m *busModule) Enqueue(meta *infra.Meta, name string, value base.Map) error {
+	return m.Dispatch(meta, name, value)
 }
 
 func encodeRequest(meta *infra.Meta, name string, payload base.Map) ([]byte, error) {
@@ -538,6 +612,9 @@ func decodeRequest(data []byte) (*infra.Meta, string, base.Map, error) {
 	if err := msgpack.Unmarshal(data, &req); err != nil {
 		return nil, "", nil, err
 	}
+	if err := validateBusName(req.Name); err != nil {
+		return nil, "", nil, err
+	}
 
 	meta := infra.NewMeta()
 	meta.Metadata(req.Metadata)
@@ -546,6 +623,17 @@ func decodeRequest(data []byte) (*infra.Meta, string, base.Map, error) {
 		req.Payload = base.Map{}
 	}
 	return meta, req.Name, req.Payload, nil
+}
+
+func validateBusName(name string) error {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return errors.New("empty bus name")
+	}
+	if strings.HasPrefix(trimmed, reservedNamePrefix) {
+		return errBusReserved
+	}
+	return nil
 }
 
 func encodeResponse(data base.Map, res base.Res) ([]byte, error) {
@@ -560,6 +648,49 @@ func encodeResponse(data base.Map, res base.Res) ([]byte, error) {
 		Data:   data,
 	}
 	return msgpack.Marshal(resp)
+}
+
+func (e DispatchError) Error() string {
+	if e.res == nil {
+		return "dispatch failed"
+	}
+	if msg := strings.TrimSpace(e.res.Error()); msg != "" {
+		return msg
+	}
+	status := strings.TrimSpace(e.res.Status())
+	if status == "" {
+		status = "dispatch failed"
+	}
+	return status
+}
+
+func (e DispatchError) Result() base.Res {
+	return e.res
+}
+
+func (e DispatchError) Retryable() bool {
+	if e.res == nil {
+		return false
+	}
+	if infra.IsRetry(e.res) {
+		return true
+	}
+	switch e.res.Status() {
+	case infra.Invalid.Status(), infra.Denied.Status(), infra.Unsigned.Status(), infra.Unauthed.Status():
+		return false
+	}
+	return e.res.Fail()
+}
+
+func IsRetryableDispatchError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var dispatchErr DispatchError
+	if errors.As(err, &dispatchErr) {
+		return dispatchErr.Retryable()
+	}
+	return true
 }
 
 func decodeResponse(data []byte) (base.Map, base.Res) {
@@ -588,19 +719,50 @@ func (inst *Instance) HandleCall(data []byte) ([]byte, error) {
 		return nil, err
 	}
 
-	body, res, _ := host.InvokeLocal(meta, name, payload)
+	body, res, _ := host.InvokeLocalService(meta, name, payload)
 	return encodeResponse(body, res)
 }
 
-// HandleAsync handles async execution (queue/event) for a bus instance.
-func (inst *Instance) HandleAsync(data []byte) error {
+// HandleServiceAsync handles async execution (queue) for service entries.
+func (inst *Instance) HandleServiceAsync(data []byte, attempt int, final bool) error {
 	meta, name, payload, err := decodeRequest(data)
 	if err != nil {
 		return err
 	}
 
-	go host.InvokeLocal(meta, name, payload)
+	if attempt <= 0 {
+		attempt = 1
+	}
+
+	setting := base.Map{
+		"_dispatch_attempt": attempt,
+		"_dispatch_final":   final,
+	}
+
+	_, res, found := host.InvokeLocalService(meta, name, payload, setting)
+	if !found {
+		return errors.New("service not found: " + name)
+	}
+	if res != nil && res.Fail() {
+		return DispatchError{res: res}
+	}
 	return nil
+}
+
+// HandleMessage handles async execution (broadcast/rolecast) for message entries.
+func (inst *Instance) HandleMessage(data []byte) error {
+	meta, name, payload, err := decodeRequest(data)
+	if err != nil {
+		return err
+	}
+
+	go host.InvokeLocalMessage(meta, name, payload)
+	return nil
+}
+
+// HandleAsync is kept as compatibility alias of HandleServiceAsync.
+func (inst *Instance) HandleAsync(data []byte) error {
+	return inst.HandleServiceAsync(data, 1, false)
 }
 
 // Stats returns service statistics from all connections.
@@ -778,6 +940,47 @@ func parseWeight(value base.Any) (int, bool) {
 		}
 	}
 	return 0, false
+}
+
+func normalizeDurations(in []time.Duration) []time.Duration {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]time.Duration, 0, len(in))
+	for _, item := range in {
+		if item > 0 {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+func DispatchFinal(retries []time.Duration, attempt int) bool {
+	if len(retries) == 0 {
+		return false
+	}
+	if attempt <= 0 {
+		attempt = 1
+	}
+	return attempt > len(retries)
+}
+
+func DispatchRetryDelay(retries []time.Duration, attempt int) (time.Duration, bool) {
+	if len(retries) == 0 {
+		return 0, false
+	}
+	if attempt <= 0 {
+		attempt = 1
+	}
+	idx := attempt - 1
+	if idx >= len(retries) {
+		return 0, false
+	}
+	delay := retries[idx]
+	if delay <= 0 {
+		delay = time.Second
+	}
+	return delay, true
 }
 
 func Stats() []infra.ServiceStats {
