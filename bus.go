@@ -288,7 +288,7 @@ func (m *busModule) Setup() {
 			cfg.Weight = 1
 		}
 		if strings.TrimSpace(cfg.Group) == "" {
-			cfg.Group = strings.TrimSpace(infra.Identity().Profile)
+			cfg.Group = strings.TrimSpace(infra.Identity().Role)
 		}
 		cfg.Prefix = normalizePrefix(cfg.Prefix)
 		m.configs[name] = cfg
@@ -626,7 +626,7 @@ func (m *busModule) ListNodes() []infra.NodeInfo {
 	for _, conn := range m.connections {
 		nodes := conn.ListNodes()
 		for _, item := range nodes {
-			key := item.Project + "|" + item.Node + "|" + item.Profile
+			key := item.Project + "|" + item.Node + "|" + item.Role + "|" + item.Profile
 			current, ok := merged[key]
 			if !ok {
 				item.Services = uniqueStrings(item.Services)
@@ -648,10 +648,13 @@ func (m *busModule) ListNodes() []infra.NodeInfo {
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].Project == out[j].Project {
-			if out[i].Profile == out[j].Profile {
-				return out[i].Node < out[j].Node
+			if out[i].Role == out[j].Role {
+				if out[i].Profile == out[j].Profile {
+					return out[i].Node < out[j].Node
+				}
+				return out[i].Profile < out[j].Profile
 			}
-			return out[i].Profile < out[j].Profile
+			return out[i].Role < out[j].Role
 		}
 		return out[i].Project < out[j].Project
 	})
@@ -680,6 +683,7 @@ func (m *busModule) ListServices() []infra.ServiceInfo {
 			}
 			info.Nodes = append(info.Nodes, infra.ServiceNode{
 				Node:    node.Node,
+				Role:    node.Role,
 				Profile: node.Profile,
 			})
 			if node.Updated > info.Updated {
@@ -691,10 +695,13 @@ func (m *busModule) ListServices() []infra.ServiceInfo {
 	out := make([]infra.ServiceInfo, 0, len(merged))
 	for _, info := range merged {
 		sort.Slice(info.Nodes, func(i, j int) bool {
-			if info.Nodes[i].Profile == info.Nodes[j].Profile {
-				return info.Nodes[i].Node < info.Nodes[j].Node
+			if info.Nodes[i].Role == info.Nodes[j].Role {
+				if info.Nodes[i].Profile == info.Nodes[j].Profile {
+					return info.Nodes[i].Node < info.Nodes[j].Node
+				}
+				return info.Nodes[i].Profile < info.Nodes[j].Profile
 			}
-			return info.Nodes[i].Profile < info.Nodes[j].Profile
+			return info.Nodes[i].Role < info.Nodes[j].Role
 		})
 		info.Instances = len(info.Nodes)
 		out = append(out, *info)

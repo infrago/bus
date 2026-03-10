@@ -130,6 +130,7 @@ func (c *defaultBusConnection) ListNodes() []infra.NodeInfo {
 		{
 			Project:  project,
 			Node:     identity.Node,
+			Role:     identity.Role,
 			Profile:  identity.Profile,
 			Services: names,
 			Updated:  time.Now().UnixMilli(),
@@ -153,6 +154,7 @@ func (c *defaultBusConnection) ListServices() []infra.ServiceInfo {
 			}
 			info.Nodes = append(info.Nodes, infra.ServiceNode{
 				Node:    node.Node,
+				Role:    node.Role,
 				Profile: node.Profile,
 			})
 			if node.Updated > info.Updated {
