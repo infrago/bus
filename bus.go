@@ -630,10 +630,14 @@ func validateBusName(name string) error {
 	if trimmed == "" {
 		return errors.New("empty bus name")
 	}
-	if strings.HasPrefix(trimmed, reservedNamePrefix) {
+	if strings.HasPrefix(trimmed, reservedNamePrefix) && !isInternalBusName(trimmed) {
 		return errBusReserved
 	}
 	return nil
+}
+
+func isInternalBusName(name string) bool {
+	return strings.HasPrefix(name, "_data.")
 }
 
 func encodeResponse(data base.Map, res base.Res) ([]byte, error) {
