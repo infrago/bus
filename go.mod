@@ -3,9 +3,9 @@ module github.com/infrago/bus
 go 1.25.3
 
 require (
-	github.com/infrago/base v0.18.0
-	github.com/infrago/infra v0.18.0
-	github.com/infrago/util v0.18.0
+	github.com/infrago/base v0.19.0
+	github.com/infrago/infra v0.19.0
+	github.com/infrago/util v0.19.0
 	github.com/vmihailenco/msgpack/v5 v5.4.1
 )
 
