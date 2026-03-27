@@ -17,7 +17,6 @@ import (
 
 var (
 	errBusNotReady = errors.New("bus is not ready")
-	errBusReserved = errors.New("bus name uses reserved prefix")
 )
 
 var (
@@ -106,9 +105,6 @@ const (
 	subjectQueue = "queue"
 	subjectEvent = "event"
 	subjectGroup = "publish"
-
-	// names with this prefix are reserved for bus internal control channels.
-	reservedNamePrefix = "_"
 )
 
 type (
@@ -630,14 +626,7 @@ func validateBusName(name string) error {
 	if trimmed == "" {
 		return errors.New("empty bus name")
 	}
-	if strings.HasPrefix(trimmed, reservedNamePrefix) && !isInternalBusName(trimmed) {
-		return errBusReserved
-	}
 	return nil
-}
-
-func isInternalBusName(name string) bool {
-	return strings.HasPrefix(name, "_data.")
 }
 
 func encodeResponse(data base.Map, res base.Res) ([]byte, error) {
